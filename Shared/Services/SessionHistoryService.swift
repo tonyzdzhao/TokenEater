@@ -7,9 +7,10 @@ import Foundation
 /// - per-file persisted cache keyed by path + mtime -> repeated opens after
 ///   the first cold scan re-use the previous result and only re-parse the
 ///   handful of files that changed since
-/// - line streaming via `enumerateLines` + `contains("input_tokens")` cheap
-///   pre-filter -> JSON parse only the assistant turns that actually carry
-///   token usage
+/// - append-aware re-parse -> a transcript whose mtime moved is read only
+///   from where the previous parse stopped (see `parseClaudeTranscript`)
+/// - chunked byte streaming + `input_tokens` pre-filter -> JSON parse only the
+///   assistant turns that actually carry token usage
 /// - TaskGroup with concurrency cap -> uses cores without saturating
 /// - cooperative cancellation via `Task.checkCancellation()`
 final class SessionHistoryService: SessionHistoryServiceProtocol {
@@ -220,37 +221,162 @@ final class SessionHistoryService: SessionHistoryServiceProtocol {
         guard let mtime = attrs?.contentModificationDate else { return nil }
 
         // Cache hit: same mtime -> reuse without touching disk.
-        if let cached = cache.entries[url.path], cached.mtime == mtime {
+        let cached = cache.entries[url.path]
+        if let cached, cached.mtime == mtime {
             return cached
         }
 
-        // Cache miss: stream the file line by line.
-        let content: String
-        do {
-            content = try String(contentsOf: url, encoding: .utf8)
-        } catch {
-            return nil
-        }
-
         if source == .codex {
+            let content: String
+            do {
+                content = try String(contentsOf: url, encoding: .utf8)
+            } catch {
+                return nil
+            }
             return try CodexHistoryParser.parse(content, path: url.path, mtime: mtime)
         }
 
-        var bucketsByHour: [Date: HistoryBucket] = [:]
-        var sessionIds: Set<String> = []
+        return try parseClaudeTranscript(url: url, mtime: mtime, previous: cached)
+    }
 
-        content.enumerateLines { line, _ in
-            // Cheap pre-filter: lines without token usage are ignored. Skips
-            // user prompts, tool_use blocks, system messages, etc.
-            guard line.contains("input_tokens") else { return }
-            guard let data = line.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { return }
+    /// Bytes per read. Bounds memory on the 500 MB+ transcripts that long
+    /// sessions reach, which a whole-file `String(contentsOf:)` loaded and
+    /// UTF-8-validated in one piece.
+    private static let readChunkSize = 4 << 20
 
+    /// Parse a Claude transcript into hourly buckets, resuming from the
+    /// previous entry when the file has only grown since.
+    ///
+    /// A live session's transcript gets a new mtime on every turn, so a
+    /// whole-file parse re-read every active transcript from byte 0 on every
+    /// scan. With ~20 open sessions that was over 1 GB of JSONL every 5
+    /// minutes (the `HistoryWidgetStore` cadence), two cores pegged for
+    /// seconds each time. Claude Code only appends to a transcript, so the
+    /// previous buckets plus the lines after `parsedBytes` are exactly what a
+    /// full parse produces. A file that shrank or was replaced (another inode)
+    /// is parsed from scratch.
+    ///
+    /// Only whole lines are consumed. A last line without its newline is
+    /// usually one Claude Code is still writing, so it waits for the next scan,
+    /// unless it already parses as a complete JSON object (a finished file
+    /// whose last line just lacks the newline).
+    private static func parseClaudeTranscript(
+        url: URL,
+        mtime: Date,
+        previous: HistoryFileCacheEntry?
+    ) throws -> HistoryFileCacheEntry? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+
+        var info = stat()
+        guard fstat(handle.fileDescriptor, &info) == 0 else { return nil }
+        let size = Int64(info.st_size)
+        let inode = UInt64(info.st_ino)
+
+        var acc = ClaudeTranscriptAccumulator(fallbackProject: decodedProject(from: url))
+        var offset: Int64 = 0
+        if let previous,
+           let parsed = previous.parsedBytes,
+           previous.inode == inode,
+           parsed <= size {
+            acc.seed(with: previous)
+            offset = parsed
+            if offset > 0 { try handle.seek(toOffset: UInt64(offset)) }
+        }
+
+        var pending = Data()
+        while true {
+            if Task.isCancelled { throw CancellationError() }
+            guard let chunk = try handle.read(upToCount: readChunkSize), !chunk.isEmpty else { break }
+            pending.append(chunk)
+            let consumed = acc.consumeCompleteLines(in: pending)
+            if consumed > 0 {
+                pending = Data(pending.dropFirst(consumed))
+                offset += Int64(consumed)
+            }
+        }
+        if !pending.isEmpty, acc.consumeTrailingLine(pending) {
+            offset += Int64(pending.count)
+        }
+
+        return acc.entry(path: url.path, mtime: mtime, parsedBytes: offset, inode: inode)
+    }
+
+    /// Running aggregation of one Claude transcript, fed line by line.
+    private struct ClaudeTranscriptAccumulator {
+        /// Cheap pre-filter: only lines carrying token usage are JSON-parsed,
+        /// which skips user prompts, tool results, system events and the like.
+        private static let usageMarker = Array("input_tokens".utf8)
+
+        let fallbackProject: String
+        private var bucketsByHour: [Date: HistoryBucket] = [:]
+        private var sessionIds: Set<String> = []
+
+        init(fallbackProject: String) {
+            self.fallbackProject = fallbackProject
+        }
+
+        /// Start from a previous parse of the same file. Its session count
+        /// sits on its earliest bucket; it is zeroed here and recomputed in
+        /// `entry`, so it is never counted twice.
+        mutating func seed(with entry: HistoryFileCacheEntry) {
+            for var bucket in entry.buckets {
+                bucket.sessionsCount = 0
+                bucketsByHour[bucket.date] = bucket
+            }
+            sessionIds = Set(entry.sessionIds)
+        }
+
+        /// Feed every newline-terminated line in `data`. Returns the number of
+        /// bytes consumed, which ends just after the last newline.
+        mutating func consumeCompleteLines(in data: Data) -> Int {
+            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int in
+                guard let base = raw.baseAddress else { return 0 }
+                let count = raw.count
+                var lineStart = 0
+                while lineStart < count,
+                      let newline = memchr(base + lineStart, 0x0A, count - lineStart) {
+                    let lineEnd = base.distance(to: UnsafeRawPointer(newline))
+                    consumeLine(base + lineStart, length: lineEnd - lineStart)
+                    lineStart = lineEnd + 1
+                }
+                return lineStart
+            }
+        }
+
+        /// Feed a last line that has no newline yet. Returns true when it was
+        /// a complete JSON object (and so is consumed for good), false when it
+        /// looks partial and must be read again on the next scan.
+        mutating func consumeTrailingLine(_ data: Data) -> Bool {
+            guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                return false
+            }
+            let hasUsage = data.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return false }
+                return Self.containsUsageMarker(base, length: raw.count)
+            }
+            if hasUsage { add(obj) }
+            return true
+        }
+
+        private static func containsUsageMarker(_ start: UnsafeRawPointer, length: Int) -> Bool {
+            usageMarker.withUnsafeBytes { marker in
+                memmem(start, length, marker.baseAddress, marker.count) != nil
+            }
+        }
+
+        private mutating func consumeLine(_ start: UnsafeRawPointer, length: Int) {
+            guard length > 0, Self.containsUsageMarker(start, length: length) else { return }
+            let line = Data(bytes: start, count: length)
+            guard let obj = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { return }
+            add(obj)
+        }
+
+        private mutating func add(_ obj: [String: Any]) {
             // Timestamp -> bucket date (start of hour).
             guard let tsString = obj["timestamp"] as? String,
-                  let date = isoDate(tsString) else { return }
-            let bucketDate = startOfHour(date)
+                  let date = SessionHistoryService.isoDate(tsString) else { return }
+            let bucketDate = SessionHistoryService.startOfHour(date)
 
             // Session id -> contributes to the distinct count.
             if let sessionId = obj["sessionId"] as? String {
@@ -265,7 +391,7 @@ final class SessionHistoryService: SessionHistoryServiceProtocol {
             if let cwd = obj["cwd"] as? String, !cwd.isEmpty {
                 projectPath = cwd
             } else {
-                projectPath = decodedProject(from: url)
+                projectPath = fallbackProject
             }
 
             // Pull message + usage payload.
@@ -300,24 +426,25 @@ final class SessionHistoryService: SessionHistoryServiceProtocol {
             bucketsByHour[bucketDate] = bucket
         }
 
-        // Each file is a single session. The session-count contribution is 1
-        // per *distinct* session id we observed. In practice that's always 1
-        // for a JSONL file, but the format technically allows multiple ids
-        // (resumes), so count properly.
-        let sessions = max(1, sessionIds.count)
-        var output = bucketsByHour
-        // Distribute the file's session count across its earliest bucket so
-        // the daily aggregator can sum without double-counting.
-        if let earliest = output.keys.min() {
-            output[earliest]?.sessionsCount = sessions
+        func entry(path: String, mtime: Date, parsedBytes: Int64, inode: UInt64) -> HistoryFileCacheEntry {
+            // Each file is a single session. The session-count contribution is
+            // 1 per *distinct* session id observed. In practice that's always 1
+            // for a JSONL file, but the format technically allows multiple ids
+            // (resumes), so count properly. It goes on the earliest bucket so
+            // the daily aggregator can sum without double-counting.
+            var output = bucketsByHour
+            if let earliest = output.keys.min() {
+                output[earliest]?.sessionsCount = max(1, sessionIds.count)
+            }
+            return HistoryFileCacheEntry(
+                path: path,
+                mtime: mtime,
+                buckets: Array(output.values).sorted { $0.date < $1.date },
+                sessionIds: Array(sessionIds),
+                parsedBytes: parsedBytes,
+                inode: inode
+            )
         }
-
-        return HistoryFileCacheEntry(
-            path: url.path,
-            mtime: mtime,
-            buckets: Array(output.values).sorted { $0.date < $1.date },
-            sessionIds: Array(sessionIds)
-        )
     }
 
     // MARK: - Aggregation across files
