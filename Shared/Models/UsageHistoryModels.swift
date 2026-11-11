@@ -357,6 +357,29 @@ struct HistoryFileCacheEntry: Codable, Sendable {
     /// might span multiple JSONL lines but the count is per session, not per
     /// line).
     let sessionIds: [String]
+    /// Claude transcripts only: how many bytes of the file `buckets` already
+    /// account for, and the file's inode when they were read. A transcript is
+    /// append-only, so when the mtime moves the next scan parses only the bytes
+    /// after this offset instead of the whole file again. Optional so caches
+    /// written before these fields existed still decode (they reparse once).
+    let parsedBytes: Int64?
+    let inode: UInt64?
+
+    init(
+        path: String,
+        mtime: Date,
+        buckets: [HistoryBucket],
+        sessionIds: [String],
+        parsedBytes: Int64? = nil,
+        inode: UInt64? = nil
+    ) {
+        self.path = path
+        self.mtime = mtime
+        self.buckets = buckets
+        self.sessionIds = sessionIds
+        self.parsedBytes = parsedBytes
+        self.inode = inode
+    }
 }
 
 struct HistoryCache: Codable, Sendable {
